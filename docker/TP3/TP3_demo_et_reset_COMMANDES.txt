@@ -1,0 +1,116 @@
+=====================================================
+ TP3 - DEMO + RESET  (microservices, Kafka, prediction)
+=====================================================
+
+Dossier du projet :
+cd "/home/alexy/ing3/zaouch/python_tools/tp2/TP Docker Estelle/tp-microservices"
+
+Remarque : copier les commandes en un seul bloc, sans les doubler.
+
+
+-----------------------------------------------------
+ A. RESET COMPLET (tout remettre a zero)
+-----------------------------------------------------
+
+# A1. Supprimer les conteneurs des services
+docker rm -f commandes prediction prediction1 prediction2 prediction3
+
+# A2. Supprimer le groupe de consommateurs (remet les offsets a zero)
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --delete --group prediction-group
+
+# A3. Supprimer les topics (efface les anciens messages)
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --delete --topic prediction_request
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --delete --topic prediction_result
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --delete --topic commandes-creees
+
+# A4. Verifier qu'il ne reste plus de topics du TP
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+# (Option radicale) tout arreter, Kafka compris :
+# docker compose down
+# Puis relancer Kafka avec : docker compose up -d kafka ; sleep 15
+
+
+-----------------------------------------------------
+ B. DEMARRAGE
+-----------------------------------------------------
+
+# B1. Kafka (si pas deja lance)
+docker compose up -d kafka
+sleep 15
+
+# B2. Creer les topics
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic prediction_request --partitions 3 --replication-factor 1
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic prediction_result --partitions 1 --replication-factor 1
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic commandes-creees --partitions 1 --replication-factor 1
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+# B3. Builder les images
+cd commandes && docker build -t commandes . && cd ..
+cd prediction && docker build -t prediction . && cd ..
+
+# B4. Lancer les services (K = 3 instances de prediction)
+docker run -d --name commandes --network reseau-kafka -e KAFKA_BROKER=kafka:9092 -p 8082:8080 commandes
+for i in 1 2 3; do docker run -d --name prediction$i --network reseau-kafka -e KAFKA_BROKER=kafka:9092 prediction; done
+sleep 30
+docker ps
+
+
+-----------------------------------------------------
+ C. DEMO
+-----------------------------------------------------
+
+# C1. Les 3 consommateurs (1 CONSUMER-ID par partition 0, 1, 2)
+#     Si "rebalancing" : attendre 20 s et relancer
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group prediction-group
+
+# C2. Une prediction
+curl -X POST http://localhost:8082/commandes -H "Content-Type: application/json" -d '{"client_id": 1, "produit": "Souris", "montant": 25}'
+sleep 5
+docker logs commandes 2>&1 | tail -5
+# Attendu : [PREDICTION RECUE] Client 1 : prediction=..., probabilite=...
+
+# C3. Flux de 10 demandes + repartition par instance
+for i in $(seq 1 10); do curl -s -X POST localhost:8082/commandes -H "Content-Type: application/json" -d "{\"client_id\": $i, \"produit\": \"Test\", \"montant\": 10}" >/dev/null; done
+sleep 5
+for i in 1 2 3; do echo "== prediction$i"; docker logs prediction$i 2>&1 | grep -c "Client"; done
+# Attendu : les 10 messages repartis entre les 3 instances (ex : 3 / 4 / 3)
+
+# C4. Lag (doit etre 0 partout)
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group prediction-group
+
+# C5. Resilience : arreter 2 instances sur 3
+docker stop prediction1 prediction2
+sleep 30
+curl -X POST http://localhost:8082/commandes -H "Content-Type: application/json" -d '{"client_id": 5, "produit": "Test", "montant": 10}'
+sleep 5
+docker logs commandes 2>&1 | tail -3
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group prediction-group
+# Attendu : prediction3 reprend les 3 partitions, la prediction arrive toujours, lag = 0
+
+# C6. Remettre les instances
+docker start prediction1 prediction2
+
+
+-----------------------------------------------------
+ D. CE QU'IL FAUT DIRE PENDANT LA DEMO
+-----------------------------------------------------
+- Kafka = boites aux lettres (topics) entre les services : communication asynchrone.
+- commandes publie une demande dans prediction_request, prediction repond dans prediction_result.
+- Le modele (modele_commande.pkl) est entraine une seule fois, puis charge au demarrage.
+- 3 partitions + meme group_id = les 3 instances se partagent la charge.
+- Si des instances tombent, les messages restent dans Kafka et les survivantes reprennent.
+- Limite : instances utiles <= nombre de partitions. Replication = 1 : si Kafka tombe, tout s'arrete.
+- Montee en charge : plus d'instances, plus de partitions, surveiller le lag.
+
+
+-----------------------------------------------------
+ E. DEPANNAGE RAPIDE
+-----------------------------------------------------
+- "network reseau-kafka not found"  -> docker network ls, puis docker network create reseau-kafka
+- "container name already in use"   -> docker rm -f NOM_DU_CONTENEUR
+- "kafka-topics.sh not found"       -> utiliser le chemin complet /opt/kafka/bin/kafka-topics.sh
+- Groupe en "rebalancing"           -> attendre 20 a 45 s
+- Vieux messages (ex : client 25)   -> normal, Kafka garde l'historique : faire le reset A
+- Ancien code dans le conteneur     -> enregistrer le fichier, verifier avec wc -l / grep, rebuild l'image
+- --delete du groupe refuse         -> les prediction* tournent encore : A1 d'abord
